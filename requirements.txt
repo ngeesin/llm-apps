@@ -1,0 +1,6 @@
+# Core dependency.
+pandas>=1.3
+
+# Optional but recommended: ~100x faster + better token-set fuzzy metric.
+# firm_dedupe falls back to the stdlib difflib if rapidfuzz is absent.
+rapidfuzz>=3.0
