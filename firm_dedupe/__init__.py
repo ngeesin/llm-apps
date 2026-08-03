@@ -15,9 +15,16 @@ from .dedupe import (
     normalize_name,
 )
 
+# GeminiAliasResolver lives in a submodule that lazily imports google-genai, so
+# importing the name here does not require the package to be installed. It only
+# fails if you actually instantiate the resolver without google-genai present.
+from .llm import DEFAULT_MODEL, GeminiAliasResolver
+
 __all__ = [
     "DEFAULT_ALIASES",
+    "DEFAULT_MODEL",
     "FirmDeduper",
+    "GeminiAliasResolver",
     "group_firms",
     "normalize_name",
 ]

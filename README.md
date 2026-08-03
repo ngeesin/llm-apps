@@ -105,6 +105,43 @@ group_firms(df, "investor", aliases={
 })
 ```
 
+## LLM-augmented alias resolution (Gemini)
+
+The hand-curated alias dictionary is the one part that needs *world knowledge* —
+and it doesn't scale: someone has to type every `GS → Goldman Sachs` pair. You
+can hand that job to Gemini instead, which knows these firms:
+
+```python
+out = group_firms(df, "investor", llm=True, aliases={})   # aliases={} = no manual table
+```
+
+Requires the optional dependency and a key:
+
+```bash
+pip install google-genai
+export GEMINI_API_KEY=...
+```
+
+**How it fits in.** The LLM does **not** replace the whole algorithm — only the
+alias step. The deterministic layers (normalization, acronym heuristic, fuzzy
+matching) still run first and do the cheap work; Gemini is then called **once, on
+the distinct cluster representatives** — not on every row — so cost scales with
+the number of unique names, not the size of the column. On Flash-Lite-tier
+pricing that's a few cents even for large columns (and the Gemini Batch API is
+~50% cheaper for async jobs). It uses structured JSON output at `temperature=0`,
+and when it names a firm, that official name becomes the group's `firm_canonical`
+label.
+
+**It fails safe.** If the API errors out, the resolver contributes nothing and
+you get the deterministic grouping instead of a crash. You can also inject your
+own resolver (any object with `resolve(names) -> {name: canonical}`) — useful for
+testing, caching, or swapping providers:
+
+```python
+from firm_dedupe import FirmDeduper
+FirmDeduper(resolver=my_resolver, aliases={}).fit(df["investor"])
+```
+
 ## Tuning cheatsheet
 
 | Parameter | Default | Raise it / turn on | Lower it / turn off |
@@ -114,6 +151,8 @@ group_firms(df, "investor", aliases={
 | `use_acronyms` | `True` | Link `GS`↔`Goldman Sachs` | Off if it over-merges |
 | `drop_geo` | `True` | Merge regional arms | `False` to keep `BlackRock UK` distinct |
 | `drop_generic` | `True` | Merge `Bridgewater`↔`Bridgewater Associates` | `False` for finer distinctions |
+| `llm` | `False` | `True` for Gemini alias resolution (needs key) | keep `False` for offline/deterministic |
+| `prefer_llm_label` | `True` | Use the LLM's official firm name as the label | `False` to keep the most-frequent raw value |
 
 ## Design notes & honest limitations
 
@@ -122,19 +161,27 @@ group_firms(df, "investor", aliases={
   token. If you want them together, add an alias — the tool errs toward
   *not* over-merging.
 - **Fuzzy matching can't invent knowledge.** Any acronym that isn't derivable
-  from initials must go in the alias dictionary; that's a deliberate, auditable
-  seam rather than a black box.
+  from initials must go in the alias dictionary *or* the Gemini layer; that's a
+  deliberate, auditable seam rather than a black box.
+- **The LLM can be wrong.** Gemini may occasionally over-merge (two different
+  funds sharing a name) or mis-canonicalize. The full raw→canonical map is
+  inspectable via `FirmDeduper.mapping()` — review it for high-stakes use. Note
+  that with the LLM on, results depend on an external API and can drift across
+  model versions even at `temperature=0`; leave `llm=False` when you need a
+  fully offline, reproducible run.
 - **Blank / NaN values** are grouped together into their own cluster and never
   merged with a real firm.
 - **Determinism:** group ids are assigned by first appearance, so the same
-  input always yields the same ids.
-- **Dependencies:** `pandas` is required; `rapidfuzz` is optional (faster and
-  a better metric) with an automatic `difflib` fallback.
+  input always yields the same ids (deterministic layers only).
+- **Dependencies:** `pandas` is required; `rapidfuzz` (faster fuzzy metric) and
+  `google-genai` (the Gemini layer) are optional — the core works without both.
 
 ## Run it
 
 ```bash
 pip install -r requirements.txt
-python examples/demo.py        # end-to-end demo on a messy column
-python tests/test_dedupe.py    # test suite (also works under pytest)
+python examples/demo.py         # end-to-end deterministic demo (no API)
+python examples/demo_gemini.py  # Gemini alias resolution (needs GEMINI_API_KEY)
+python tests/test_dedupe.py     # deterministic test suite
+python tests/test_llm.py        # LLM-layer tests (stubbed, no network)
 ```

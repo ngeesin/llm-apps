@@ -4,3 +4,8 @@ pandas>=1.3
 # Optional but recommended: ~100x faster + better token-set fuzzy metric.
 # firm_dedupe falls back to the stdlib difflib if rapidfuzz is absent.
 rapidfuzz>=3.0
+
+# Optional: enables the Gemini-backed alias resolver (group_firms(..., llm=True)
+# / GeminiAliasResolver). Only needed if you use the LLM layer; requires a
+# GEMINI_API_KEY. The core deterministic algorithm works without it.
+google-genai>=0.3

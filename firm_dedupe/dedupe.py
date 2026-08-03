@@ -257,6 +257,16 @@ class FirmDeduper:
     drop_geo, drop_generic:
         Forwarded to :func:`normalize_name` to control how aggressively the
         key is reduced before comparison.
+    resolver:
+        Optional LLM alias resolver exposing ``resolve(names) -> {name:
+        canonical}`` (e.g. :class:`firm_dedupe.llm.GeminiAliasResolver`). When
+        provided it runs last, on the deterministic-cluster representatives, and
+        merges any that share a canonical name -- catching acronyms/expansions
+        that string matching cannot. ``None`` (default) keeps the pipeline fully
+        deterministic and offline.
+    prefer_llm_label:
+        When True (default) and the resolver named a group, use that canonical
+        name as the group's label instead of the most-frequent raw value.
     """
 
     def __init__(
@@ -267,11 +277,22 @@ class FirmDeduper:
         use_acronyms: bool = True,
         drop_geo: bool = True,
         drop_generic: bool = True,
+        resolver: object = None,
+        prefer_llm_label: bool = True,
     ) -> None:
         self.threshold = threshold
         self.use_acronyms = use_acronyms
         self.drop_geo = drop_geo
         self.drop_generic = drop_generic
+        # Optional LLM alias resolver: any object exposing
+        # ``resolve(names) -> {name: canonical}``. When set, it supplies the
+        # world-knowledge merges (acronyms/expansions) that no string metric
+        # can, replacing/augmenting the static alias dictionary. See
+        # :class:`firm_dedupe.llm.GeminiAliasResolver`.
+        self.resolver = resolver
+        self.prefer_llm_label = prefer_llm_label
+        # group id -> canonical label proposed by the resolver (filled in fit).
+        self._llm_label_by_id: Dict[int, str] = {}
         if aliases is None:
             self.aliases = dict(DEFAULT_ALIASES)
         else:
@@ -345,6 +366,27 @@ class FirmDeduper:
                 if _similarity(ni, nj) >= self.threshold:
                     uf.union(reps[i], reps[j])
 
+        # Signal 5: LLM alias resolution (world knowledge). Runs on the cluster
+        # representatives only -- so cost scales with distinct names, not rows,
+        # and the model sees clean input. Names the resolver maps to the same
+        # canonical string are merged. Resilient: resolver failures are absorbed
+        # here (it returns {}), so the deterministic result above still stands.
+        rep_canonical: Dict[str, str] = {}
+        if self.resolver is not None and len(reps) > 1:
+            try:
+                resolved = self.resolver.resolve(reps)
+            except Exception:  # noqa: BLE001 - never let the LLM break grouping
+                resolved = {}
+            canon_anchor: Dict[str, str] = {}
+            for r in reps:
+                canonical = resolved.get(r)
+                if not canonical:
+                    continue
+                rep_canonical[r] = canonical
+                key = canonical.strip().lower()
+                anchor = canon_anchor.setdefault(key, r)
+                uf.union(anchor, r)
+
         # Assign dense, deterministic group ids (ordered by first appearance).
         root_to_id: Dict[str, int] = {}
         value_to_id: Dict[str, int] = {}
@@ -353,6 +395,13 @@ class FirmDeduper:
             if root not in root_to_id:
                 root_to_id[root] = len(root_to_id)
             value_to_id[v] = root_to_id[root]
+
+        # Record the resolver's canonical name per final group, for labelling.
+        self._llm_label_by_id = {}
+        for rep, canonical in rep_canonical.items():
+            gid = value_to_id[rep]
+            self._llm_label_by_id.setdefault(gid, canonical)
+
         return value_to_id
 
     def _canonical_labels(
@@ -367,7 +416,13 @@ class FirmDeduper:
 
         labels: Dict[int, str] = {}
         for gid, counter in counts_by_group.items():
-            # sort by (frequency desc, length desc, alphabetical) for stability
+            # Prefer the resolver's canonical name -- the official firm name is
+            # a better label than whichever raw variant happened to be common.
+            if self.prefer_llm_label and gid in self._llm_label_by_id:
+                labels[gid] = self._llm_label_by_id[gid]
+                continue
+            # Otherwise: most frequent raw value, tie-broken by longest, then
+            # alphabetical, for a stable and descriptive label.
             best = max(
                 counter.items(),
                 key=lambda kv: (kv[1], len(str(kv[0])), str(kv[0])),
@@ -408,6 +463,11 @@ def group_firms(
     use_acronyms: bool = True,
     drop_geo: bool = True,
     drop_generic: bool = True,
+    llm: bool = False,
+    resolver: object = None,
+    llm_model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    prefer_llm_label: bool = True,
 ) -> "pd.DataFrame":
     """Add group-id and canonical-name columns to ``df`` for ``column``.
 
@@ -417,6 +477,16 @@ def group_firms(
       by all rows judged to be the same firm.
     - ``canonical_col`` (default ``"firm_canonical"``): a single human-readable
       label chosen for each group.
+
+    LLM-augmented grouping
+    ----------------------
+    Pass ``llm=True`` to add a Gemini-backed alias-resolution pass that links
+    acronyms/expansions no string metric can (``GS`` <-> ``Goldman Sachs``),
+    replacing the need to hand-maintain ``aliases``. It requires the
+    ``google-genai`` package and a ``GEMINI_API_KEY`` (or pass ``api_key``).
+    Alternatively pass any ``resolver`` object exposing ``resolve(names) ->
+    {name: canonical}`` directly (e.g. a stub in tests). ``llm``/``resolver``
+    default off, so existing behaviour is unchanged.
 
     Example
     -------
@@ -432,12 +502,23 @@ def group_firms(
             f"column {column!r} not found; available: {list(df.columns)}"
         )
 
+    if resolver is None and llm:
+        # Lazy import keeps google-genai optional for non-LLM usage.
+        from .llm import DEFAULT_MODEL, GeminiAliasResolver
+
+        resolver = GeminiAliasResolver(
+            model=llm_model or DEFAULT_MODEL,
+            api_key=api_key,
+        )
+
     deduper = FirmDeduper(
         threshold=threshold,
         aliases=aliases,
         use_acronyms=use_acronyms,
         drop_geo=drop_geo,
         drop_generic=drop_generic,
+        resolver=resolver,
+        prefer_llm_label=prefer_llm_label,
     )
     deduper.fit(df[column].tolist())
 
